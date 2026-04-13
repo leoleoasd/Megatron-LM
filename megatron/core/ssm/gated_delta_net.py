@@ -295,22 +295,25 @@ class GatedDeltaNet(MegatronModule):
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
 
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
             assert (
                 not self.config.deterministic_mode
             ), "Packed sequence does not support deterministic mode."
 
-            # Prefer cu_seqlens_q_padded if available, otherwise use cu_seqlens_q
-            if packed_seq_params.cu_seqlens_q_padded is not None:
-                cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
-            else:
-                cu_seqlens_q = packed_seq_params.cu_seqlens_q
-            # Prefer cu_seqlens_kv_padded if available, otherwise use cu_seqlens_kv
-            if packed_seq_params.cu_seqlens_kv_padded is not None:
-                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
-            else:
-                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+            # Resolve cu_seqlens with alignment padding handling.
+            cu_seqlens_q = self._resolve_cu_seqlens(
+                packed_seq_params.cu_seqlens_q_padded,
+                packed_seq_params.cu_seqlens_q,
+                seq_len,
+                "cu_seqlens_q",
+            )
+            cu_seqlens_kv = self._resolve_cu_seqlens(
+                packed_seq_params.cu_seqlens_kv_padded,
+                packed_seq_params.cu_seqlens_kv,
+                seq_len,
+                "cu_seqlens_kv",
+            )
             assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
                 f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
@@ -330,7 +333,7 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="in_proj")
 
         # CP All to All: CP to HP
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // self.cp_size, dim=0)
             outputs = []
             for qkvzba_i in unpacked_qkvzba:
@@ -502,7 +505,7 @@ class GatedDeltaNet(MegatronModule):
         norm_out = norm_out.transpose(0, 1).contiguous()
 
         # CP all to all: HP to CP
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
             outputs = []
             for norm_out_i in unpacked_norm_out:
@@ -534,6 +537,74 @@ class GatedDeltaNet(MegatronModule):
         y = y * self.act_fn(gate.float())
         y = y.to(x_dtype)
         return y
+
+    @jit_fuser
+    def _prepare_qkv_for_gated_delta_rule(self, qkv, gate, beta, alpha, batch, seq_len):
+        """
+        Prepare query, key, value, gate, beta, alpha tensors for gated delta rule.
+        Fuses split, reshape, L2 norm, repeat_interleave, and contiguous operations.
+        """
+        # Split qkv into query_key and value
+        query_key, value = torch.split(
+            qkv,
+            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
+            dim=-1,
+        )
+
+        # Reshape query_key and value
+        query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
+        value = value.reshape(batch, seq_len, -1, self.value_head_dim)
+
+        # Apply L2 norm to query and key
+        if self.use_qk_l2norm:
+            query_key = l2norm(query_key.contiguous())
+
+        # Split query and key
+        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
+        query, key = torch.split(query_key, [split_size, split_size], dim=2)
+
+        # Expand query and key if needed (grouped query attention)
+        if self.num_value_heads // self.num_key_heads > 1:
+            repeat_factor = self.num_value_heads // self.num_key_heads
+            query = query.repeat_interleave(repeat_factor, dim=2)
+            key = key.repeat_interleave(repeat_factor, dim=2)
+
+        # Make all tensors contiguous
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+        gate = gate.contiguous()
+        beta = beta.contiguous()
+        alpha = alpha.contiguous()
+
+        return query, key, value, gate, beta, alpha
+
+    @jit_fuser
+    def _compute_g_and_beta(self, A_log_local_cp, dt_bias_local_cp, alpha, beta):
+        """
+        Compute g (decay) and beta (sigmoid) for gated delta rule.
+        Fuses exp, softplus, mul, neg, and sigmoid operations.
+        """
+        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
+        beta = beta.sigmoid()
+        return g, beta
+
+    def _resolve_cu_seqlens(self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name):
+        """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
+        if cu_seqlens_padded is not None:
+            cu_seqlens = cu_seqlens_padded
+        else:
+            cu_seqlens = cu_seqlens_actual
+
+        total_cu = cu_seqlens[-1].item()
+        if total_cu != total_seq_len:
+            raise ValueError(
+                f"GDN: {name}[-1]={total_cu} does not match "
+                f"total_sequence_length={total_seq_len}. "
+                f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
+            )
+
+        return cu_seqlens
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
