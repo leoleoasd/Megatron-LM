@@ -15,6 +15,10 @@ include = [
   "megatron.training.*",
   "megatron.legacy",
   "megatron.legacy.*",
+  "megatron.rl",
+  "megatron.rl.*",
+  "megatron.post_training",
+  "megatron.post_training.*",
 ]
 
 [tool.setuptools.dynamic]
