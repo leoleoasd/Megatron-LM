@@ -7,8 +7,16 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 include-package-data = true
 
+# slime_uv: install the full Megatron tree, not just megatron.core. slime's
+# training mainline imports megatron.training / megatron.legacy / megatron.rl /
+# megatron.post_training, which the upstream "megatron.core only" discovery
+# dropped from the wheel (the Dockerfile gets away with `pip install -e .`).
 [tool.setuptools.packages.find]
-include = ["megatron.core", "megatron.core.*"]
+include = ["megatron*"]
+
+[tool.setuptools.package-data]
+# Ship the legacy fused-kernel C++ headers needed for runtime JIT compilation.
+"megatron.legacy.fused_kernels" = ["*.h"]
 
 [tool.setuptools.dynamic]
 version = { attr = "megatron.core.package_info.__version__" }
