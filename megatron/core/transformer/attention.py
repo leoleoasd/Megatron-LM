@@ -1491,6 +1491,19 @@ class SelfAttention(Attention):
         if output_gate:
             # Gate [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
             gate = gate.reshape(*gate.shape[:2], -1, self.hidden_size_per_attention_head)
+            if self.config.num_query_groups < self.world_size:
+                # Mirror the query "step 4" slice: index into gate to get only the
+                # (num_q_heads / tp_size) q_heads this rank owns. Without this the
+                # gate keeps (world_size // num_query_groups)x too many heads and
+                # _apply_output_gate's gate.view(*core_attn_out.shape) fails when
+                # tp_size > num_query_groups (e.g. Qwen3.5 122B-A10B at TP4, nqg=2).
+                idx = get_tensor_model_parallel_rank() % (
+                    self.world_size // self.config.num_query_groups
+                )
+                size = self.num_attention_heads_per_partition // (
+                    self.world_size // self.config.num_query_groups
+                )
+                gate = gate[:, :, idx * size : (idx + 1) * size, :]
             return query, key, value, gate
 
         return query, key, value
